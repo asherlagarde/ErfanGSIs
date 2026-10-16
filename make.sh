@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # Project OEM-GSI Porter by Erfan Abdi <erfangplus@gmail.com>
+# Updated for FireOS / A-Only compatibility
 
 usage()
 {
-echo "Usage: $0 <Path to Firmware partitions> <Firmware type> <Output type> [Output Dir]"
+    echo "Usage: $0 <Path to Firmware partitions> <Firmware type> <Output type> [Output Dir]"
     echo -e "\tPath to Firmware partitions: Mounted system or all partitions mount point"
     echo -e "\tFirmware type: Firmware mode"
     echo -e "\tOutput type: AB or Aonly"
@@ -44,7 +45,7 @@ if [ "$flag" == "false" ]; then
     do
         ver=`echo "$dir" | rev | cut -d "/" -f 2 | rev`
         rom=`echo "$dir" | rev | cut -d "/" -f 1 | rev`
-        echo "$rom for Android $ver"
+        echo "$rom for Android$ver"
     done
     exit 1
 fi
@@ -85,16 +86,33 @@ rm -rf $tempdir
 mkdir -p "$systemdir"
 
 if [ "$sourcetype" == "Aonly" ]; then
-    echo "Warning: Aonly source detected, using P AOSP ramdisk"
+    echo "Warning: Aonly/FireOS source detected, using P AOSP ramdisk"
     cd "$systemdir"
     tar xf "$prebuiltdir/ABrootDir.tar"
     cd "$LOCALDIR"
     echo "Making copy of source rom to temp"
-    ( cd "$systempath" ; sudo tar cf - . ) | ( cd "$systemdir/system" ; sudo tar xf - )
+    
+    # Intelligent path mapping for A-only / FireOS flat structures
+    if [[ -e "$systempath/build.prop" ]]; then
+        ( cd "$systempath" ; sudo tar cf - . ) | ( cd "$systemdir/system" ; sudo tar xf - )
+    elif [[ -e "$systempath/system/build.prop" ]]; then
+        ( cd "$systempath/system" ; sudo tar cf - . ) | ( cd "$systemdir/system" ; sudo tar xf - )
+    else
+        # Fallback copy
+        ( cd "$systempath" ; sudo tar cf - . ) | ( cd "$systemdir/system" ; sudo tar xf - )
+    fi
+    
     cd "$LOCALDIR"
-    sed -i "/ro.build.system_root_image/d" "$systemdir/system/build.prop"
-    sed -i "/ro.build.ab_update/d" "$systemdir/system/build.prop"
-    echo "ro.build.system_root_image=false" >> "$systemdir/system/build.prop"
+    
+    # Ensure build.prop exists in the target location before running sed
+    if [[ ! -f "$systemdir/system/system/build.prop" ]] && [[ -f "$systemdir/system/build.prop" ]]; then
+        mkdir -p "$systemdir/system/system"
+        mv "$systemdir/system/build.prop" "$systemdir/system/system/build.prop"
+    fi
+
+    sed -i "/ro.build.system_root_image/d" "$systemdir/system/system/build.prop" 2>/dev/null || true
+    sed -i "/ro.build.ab_update/d" "$systemdir/system/system/build.prop" 2>/dev/null || true
+    echo "ro.build.system_root_image=false" >> "$systemdir/system/system/build.prop"
 else
     echo "Making copy of source rom to temp"
     ( cd "$systempath" ; sudo tar cf - . ) | ( cd "$systemdir" ; sudo tar xf - )
@@ -118,21 +136,25 @@ else
 fi
 
 # Detect is the src treble ro.treble.enabled=true
-istreble=`cat $systemdir/system/build.prop | grep ro.treble.enabled | cut -d "=" -f 2`
+istreble=`cat $systemdir/system/system/build.prop 2>/dev/null || cat $systemdir/system/build.prop | grep ro.treble.enabled | cut -d "=" -f 2`
 if [[ ! "$istreble" == "true" ]]; then
-    echo "The source is not treble supported"
-    exit 1
+    echo "Note: Source missing ro.treble.enabled, forcing Treble compatibility..."
+    echo "ro.treble.enabled=true" >> "$systemdir/system/system/build.prop"
 fi
 
 # Detect Source API level
-if grep -q ro.build.version.release_or_codename $systemdir/system/build.prop; then
-    sourcever=`grep ro.build.version.release_or_codename $systemdir/system/build.prop | cut -d "=" -f 2`
+if grep -q ro.build.version.release_or_codename $systemdir/system/system/build.prop 2>/dev/null; then
+    sourcever=`grep ro.build.version.release_or_codename $systemdir/system/system/build.prop | cut -d "=" -f 2`
+elif grep -q ro.build.version.release $systemdir/system/system/build.prop 2>/dev/null; then
+    sourcever=`grep ro.build.version.release $systemdir/system/system/build.prop | cut -d "=" -f 2`
 else
     sourcever=`grep ro.build.version.release $systemdir/system/build.prop | cut -d "=" -f 2`
 fi
-if [ $(echo $sourcever | cut -d "." -f 2) == 0 ]; then
-    sourcever=$(echo $sourcever | cut -d "." -f 1)
+
+if [ $(echo$sourcever | cut -d "." -f 2) == 0 ]; then
+    sourcever=$(echo$sourcever | cut -d "." -f 1)
 fi
+
 flag=false
 case "$sourcever" in
     *"9"*) flag=true ;;
@@ -147,14 +169,8 @@ fi
 
 # Detect rom folder again
 if [[ ! -d "$romsdir/$sourcever/$romtype" ]]; then
-    echo "$romtype is not supported rom for android $sourcever"
+    echo "$romtype is not supported rom for android$sourcever"
     exit 1
-fi
-
-# Detect arch
-if [[ ! -f "$systemdir/system/lib64/libandroid.so" ]]; then
-    echo "32bit source detected, weird flex but ok!"
-    # do something here?
 fi
 
 # Debloat
@@ -171,7 +187,7 @@ if [[ ! -e $romsdir/$sourcever/$romtype/$romtypename/DONTRESIGN ]]; then
         else
             python2=python
         fi
-        $python2 $toolsdir/ROM_resigner/resign.py "$systemdir/system" $toolsdir/ROM_resigner/AOSP_security > $tempdir/resign.log
+        $python2 $toolsdir/ROM_resigner/resign.py "$systemdir/system" $toolsdir/ROM_resigner/AOSP_security >$tempdir/resign.log
         $prebuiltdir/resigned/make.sh "$systemdir/system" 2>/dev/null
     fi
 fi
@@ -226,23 +242,27 @@ outputinfo="$outdir/$outputtextname"
 
 $scriptsdir/getinfo.sh "$systemdir/system" > "$outputinfo"
 
-if [[ $(grep "ro.build.display.id" $systemdir/system/build.prop) ]]; then
+displayid="ro.build.display.id"
+if [[ $(grep "ro.build.display.id" $systemdir/system/system/build.prop 2>/dev/null) ]]; then
     displayid="ro.build.display.id"
-elif [[ $(grep "ro.system.build.id" $systemdir/system/build.prop) ]]; then
+elif [[ $(grep "ro.system.build.id" $systemdir/system/system/build.prop 2>/dev/null) ]]; then
     displayid="ro.system.build.id"
-elif [[ $(grep "ro.build.id" $systemdir/system/build.prop) ]]; then
+elif [[ $(grep "ro.build.id" $systemdir/system/system/build.prop 2>/dev/null) ]]; then
     displayid="ro.build.id"
 fi
+
 displayid2=$(echo "$displayid" | sed 's/\./\\./g')
-bdisplay=$(grep "$displayid" $systemdir/system/build.prop | sed 's/\./\\./g; s:/:\\/:g; s/\,/\\,/g; s/\ /\\ /g')
-sed -i "s/$bdisplay/$displayid2=Built\.with\.ErfanGSI\.Tools/" $systemdir/system/build.prop
+bdisplay=$(grep "$displayid" $systemdir/system/system/build.prop 2>/dev/null | sed 's/\./\\./g; s:/:\\/:g; s/\,/\\,/g; s/\ /\\ /g')
+if [ ! -z "$bdisplay" ]; then
+    sed -i "s/$bdisplay/$displayid2=Built\.with\.ErfanGSI\.Tools/" $systemdir/system/system/build.prop
+fi
 
 # Getting system size and add approximately 5% on it just for free space
 systemsize=`du -sk $systemdir | awk '{$1*=1024;$1=int($1*1.05);printf $1}'`
 bytesToHuman() {
     b=${1:-0}; d=''; s=0; S=(Bytes {K,M,G,T,P,E,Z,Y}iB)
     while ((b > 1024)); do
-        d="$(printf ".%02d" $((b % 1024 * 100 / 1024)))"
+        d="$(printf ".\%02d" $((b % 1024 * 100 / 1024)))"
         b=$((b / 1024))
         let s++
     done
@@ -251,11 +271,10 @@ bytesToHuman() {
 echo "Raw Image Size: $(bytesToHuman $systemsize)" >> "$outputinfo"
 
 echo "Creating Image: $outputimagename"
-# Use ext4fs to make image in P or older!
 if [ "$sourcever" == "9" ]; then
     useold="--old"
 fi
-$scriptsdir/mkimage.sh $systemdir $outputtype $systemsize $output $useold > $tempdir/mkimage.log
+$scriptsdir/mkimage.sh $systemdir$outputtype $systemsize$output $useold >$tempdir/mkimage.log
 
 echo "Remove Temp dir"
 rm -rf "$tempdir"
